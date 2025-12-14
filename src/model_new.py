@@ -11,7 +11,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from constraintsDB import CONSTRAINTS_DB, SUBCLASS_TO_FESTIVAL
 import math
+from dotenv import load_dotenv
 
+load_dotenv()
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+# ==========================================
+# PHẦN 1: YOLO PIPELINE 
+# ==========================================
 
 class YOLOCSVPipeline:
     def __init__(self, model_path, csv_path):
@@ -682,6 +689,51 @@ class YOLOCSVPipeline:
 
         print("\n❌ Không phát hiện object nào!")
         return None
+    
+    def process_video(self, video_path, confidence_threshold=0.5, fps_detect=1):
+        """Xử lý video và trả về list ObjectDetection (Dùng cho Bayesian Classifier)"""
+        cap = cv2.VideoCapture(video_path)
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_interval = int(video_fps / fps_detect)
+        
+        all_objects = []
+        frame_count = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+
+            if frame_count % frame_interval == 0:
+                raw_dets = self.predict_and_map_with_boxes(frame, confidence_threshold)
+                
+                # Group by subclass trong frame hiện tại
+                subclass_groups = {}
+                for d in raw_dets:
+                    # Chỉ lấy detection có mapping hợp lệ
+                    if d.get('mapped'):
+                        lbl = d['label']
+                        if lbl not in subclass_groups:
+                            subclass_groups[lbl] = {'confs': [], 'boxes': []}
+                        subclass_groups[lbl]['confs'].append(d['confidence'])
+                        subclass_groups[lbl]['boxes'].append(d['box'])
+
+                time_stamp = frame_count / video_fps
+                
+                for sub, data in subclass_groups.items():
+                    obj = ObjectDetection(
+                        subclass=sub,
+                        confidence=np.mean(data['confs']),
+                        frame_id=frame_count,
+                        time_stamp=time_stamp,
+                        count=len(data['boxes']),
+                        bboxs=data['boxes']
+                    )
+                    all_objects.append(obj)
+            
+            frame_count += 1
+        
+        cap.release()
+        return all_objects
 
 
 # Định nghĩa cấu trúc dữ liệu
@@ -708,415 +760,367 @@ class ObjectDetection:
 # ("is_on", ["bong_dua", "trai_dua"], False, 0.5, None)  # Soft, weight 0.5 nếu "bong_dua" on "trai_dua" (có thể dùng spatial check)
 # ("confidence_min", ["all"], True, 1.0, 0.7)  # Hard, avg confidence >=0.7
 
+# ==========================================
+# CẤU HÌNH TOÀN CỤC (Từ PSEUDO)
+# ==========================================
+GLOBAL_CONFIG = {
+    "T_high": 0.85,    # Ngưỡng tin cậy cao để chọn ứng viên ngay
+    "T_low": 0.50,     # Ngưỡng thấp nhất để xem xét
+    "delta": 0.25,     # Chênh lệch tối đa cho phép so với conf_max
+    "T_out": 0.85      # Ngưỡng quyết định cuối cùng (sau khi hỏi user)
+}
+
+# ==========================================
+# CÁC HÀM TOÁN HỌC BỔ TRỢ
+# ==========================================
+def clip_confidence(p):
+    """Giới hạn p trong khoảng (epsilon, 1-epsilon) để tránh log(0)"""
+    eps = 1e-6
+    if p < eps: p = eps
+    if p > 1 - eps: p = 1 - eps
+    return p
+
+def logit(p):
+    """Chuyển đổi xác suất p sang không gian Logit (Log-odds)"""
+    p = clip_confidence(p)
+    return math.log(p / (1 - p))
+
+def sigmoid(x):
+    """Chuyển đổi ngược từ Logit sang xác suất [0, 1]"""
+    return 1 / (1 + math.exp(-x))
+
+# ==========================================
+# CLASS DATA STRUCTURE
+# ==========================================
+class ObjectDetection:
+    def __init__(self, subclass, confidence, frame_id, time_stamp, count, bboxs):
+        self.subclass = subclass          # e.g., "binh_bong_dua"
+        self.confidence = confidence      # trung bình các confidence trong frame
+        self.frame_id = frame_id          # số thứ tự frame
+        self.time_stamp = time_stamp      # thời gian (giây)
+        self.count = count                # số lần subclass xuất hiện trong frame
+        self.bboxs = bboxs                # danh sách bounding box [x1, y1, x2, y2]
+    
+    def __repr__(self):
+        return f"<Obj: {self.subclass}, Conf: {self.confidence:.2f}, Count: {self.count}>"
 
 
-def check_constraints(detections, CONSTRAINTS_DB, SUBCLASS_TO_FESTIVAL=None, score_threshold=0.7):
-    """
-    Hàm kiểm tra ràng buộc (Logic đã tinh chỉnh).
+# ==========================================
+# PHẦN 2: BAYESIAN REASONING CORE (LOGIT + ADDITIVE ONLY)
+# ==========================================
+class BayesianFestivalClassifier:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        # Khởi tạo LLM
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, max_retries=3)
 
-    Args:
-        detections: List[ObjectDetection] - Output từ YOLO sau khi qua xử lý
-        CONSTRAINTS_DB: Dict - Cơ sở dữ liệu luật
-        SUBCLASS_TO_FESTIVAL: Dict (Optional) - Dùng để lọc nhanh ứng viên
-        score_threshold: Float - Ngưỡng điểm để chấp nhận kết quả
+    def _index_detections(self, detections):
+        """Tạo index để truy xuất nhanh O(1)"""
+        by_subclass = defaultdict(list)
+        by_frame = defaultdict(list)
+        for d in detections:
+            by_subclass[d.subclass].append(d)
+            by_frame[d.frame_id].append(d)
+        return by_subclass, by_frame
 
-    Returns:
-        Dict: Cấu trúc kết quả giữ nguyên như cũ.
-    """
-
-    # --- 1. Tiền xử lý dữ liệu (Indexing) ---
-    # Gom nhóm để truy xuất nhanh O(1) thay vì loop nhiều lần
-    detections_by_subclass = defaultdict(list)
-    detections_by_frame = defaultdict(list)
-
-    for det in detections:
-        # Chỉ xét các object có mapping hợp lệ
-        detections_by_subclass[det.subclass].append(det)
-        detections_by_frame[det.frame_id].append(det)
-
-    # Hàm phụ kiểm tra vị trí (IS_ON)
-    def check_is_on_logic(top_subclass, bottom_subclass):
-        # Duyệt qua các frame có xuất hiện cả 2 loại object
-        relevant_frames = set(d.frame_id for d in detections_by_subclass[top_subclass]) & \
-                        set(d.frame_id for d in detections_by_subclass[bottom_subclass])
-
+    def _check_is_on(self, top_sub, bot_sub, by_subclass, by_frame):
+        """Kiểm tra quan hệ không gian"""
+        relevant_frames = set(d.frame_id for d in by_subclass[top_sub]) & \
+                        set(d.frame_id for d in by_subclass[bot_sub])
         for fid in relevant_frames:
-            tops = [d for d in detections_by_frame[fid] if d.subclass == top_subclass]
-            bottoms = [d for d in detections_by_frame[fid] if d.subclass == bottom_subclass]
-
+            tops = [d for d in by_frame[fid] if d.subclass == top_sub]
+            bots = [d for d in by_frame[fid] if d.subclass == bot_sub]
             for t in tops:
-                for b in bottoms:
-                    for box_t in t.bboxs: # box_t: [x1, y1, x2, y2]
+                for b in bots:
+                    for box_t in t.bboxs:
                         for box_b in b.bboxs:
-                            # Kiểm tra overlap trục X (ngang)
                             x_overlap = max(0, min(box_t[2], box_b[2]) - max(box_t[0], box_b[0]))
                             width_t = box_t[2] - box_t[0]
-
-                            # Kiểm tra trục Y: Đáy của Top phải nằm gần Đỉnh của Bottom
-                            # box[1]=y1 (top), box[3]=y2 (bottom) - Giả sử trục y hướng xuống
                             vertical_gap = box_b[1] - box_t[3]
-
-                            # Logic: Overlap ngang > 30% width vật trên VÀ khoảng cách dọc < 20px
-                            if width_t > 0 and (x_overlap / width_t) > 0.3 and -50 <= vertical_gap <= 50:
+                            if width_t > 0 and (x_overlap/width_t) > 0.3 and -50 <= vertical_gap <= 50:
                                 return True
         return False
 
-    # --- 2. Lọc ứng viên (Candidate Filtering) ---
-    if SUBCLASS_TO_FESTIVAL:
-        detected_subclasses = set(detections_by_subclass.keys())
-        candidate_festivals = set()
-        for sub in detected_subclasses:
-            if sub in SUBCLASS_TO_FESTIVAL:
-                candidate_festivals.update(SUBCLASS_TO_FESTIVAL[sub])
-
-        if not candidate_festivals:
-            candidate_festivals = set(CONSTRAINTS_DB.keys())
-    else:
-        candidate_festivals = set(CONSTRAINTS_DB.keys())
-
-    # --- 3. Đánh giá từng lễ hội ---
-    festival_results = {}
-
-    for festival in candidate_festivals:
-        # Nếu lễ hội không có trong DB luật thì bỏ qua
-        if festival not in CONSTRAINTS_DB:
-            continue
-
-        constraints = CONSTRAINTS_DB[festival]
-        total_weight_achieved = 0.0
-        total_weight_possible = 0.0
-        hard_failed = False
-
-        # Lưu chi tiết từng luật để debug/giải thích
-        rule_details = []
-
-        for (ctype, params, is_hard, weight, threshold) in constraints:
-            satisfied = False
-            current_val = 0 # Giá trị thực tế đo được (để so sánh với threshold)
-
-            # --- LOGIC TỪNG LOẠI RÀNG BUỘC ---
-
-            # 1. IS_PRESENCE: Có xuất hiện trong video không?
-            if ctype == "is_presence":
-                # Logic: Tất cả params phải có mặt
-                missing_params = [p for p in params if p not in detections_by_subclass]
-                satisfied = len(missing_params) == 0
-
-            # 2. IS_PRESENCE_IN_FRAME: Cùng xuất hiện trong 1 frame
-            elif ctype == "is_presence_in_frame":
-                # Logic: Tìm xem có frame nào chứa đủ tất cả params không
-                for fid, dets in detections_by_frame.items():
-                    subs_in_frame = {d.subclass for d in dets}
-                    if all(p in subs_in_frame for p in params):
-                        satisfied = True
-                        break
-
-            # 3. AT_LEAST: Tổng số lượng (Cộng dồn count) >= Threshold
-            elif ctype == "at_least":
-                # Logic: Tổng count của tất cả params >= threshold
-                total_count = 0
-                for p in params:
-                    if p in detections_by_subclass:
-                        total_count += sum(d.count for d in detections_by_subclass[p])
-                current_val = total_count
-                satisfied = total_count >= (threshold or 1)
-
-            # 4. AT_LEAST_IN_FRAME: (Giữ nguyên logic cũ hoặc hiểu là xuất hiện cùng nhau >= N lần)
-            # Theo code cũ của bạn: Check xem có frame nào chứa đủ params và count >= threshold
-            elif ctype == "at_least_in_frame":
-                for fid, dets in detections_by_frame.items():
-                    subs_in_frame = {d.subclass for d in dets}
-                    # Check đủ loại
-                    if all(p in subs_in_frame for p in params):
-                        # Check đủ lượng (tổng lượng của các params trong frame này)
-                        frame_count = sum(d.count for d in dets if d.subclass in params)
-                        if frame_count >= (threshold or 1):
-                            satisfied = True
-                            break
-
-            # 5. CONFIDENCE_MIN: Độ tin cậy trung bình >= Threshold
-            elif ctype == "confidence_min":
-                target_subs = []
-                if "all" in params:
-                    target_subs = list(detections_by_subclass.keys())
-                else:
-                    target_subs = [p for p in params if p in detections_by_subclass]
-
-                if target_subs:
-                    # Tính trung bình có trọng số (weighted by count)
-                    total_conf = 0
-                    total_cnt = 0
-                    for sub in target_subs:
-                        for d in detections_by_subclass[sub]:
-                            total_conf += d.confidence * d.count
-                            total_cnt += d.count
-
-                    avg_conf = total_conf / total_cnt if total_cnt > 0 else 0
-                    current_val = avg_conf
-                    satisfied = avg_conf >= (threshold or 0)
-                else:
-                    satisfied = False # Không tìm thấy đối tượng để check confidence
-
-            # 6. IS_ON: Vị trí tương đối
-            elif ctype == "is_on" and len(params) == 2:
-                satisfied = check_is_on_logic(params[0], params[1])
-
-            # --- TÍNH ĐIỂM ---
-            total_weight_possible += weight
-
-            if satisfied:
-                total_weight_achieved += weight
-            elif is_hard:
-                hard_failed = True
-
-            # Lưu log (nếu cần mở rộng sau này)
-            # rule_details.append({"type": ctype, "satisfied": satisfied, "hard": is_hard})
-
-        # --- TỔNG HỢP KẾT QUẢ CHO LỄ HỘI ---
-
-        # Điểm chuẩn hóa (Normalized Score): Luôn từ 0.0 đến 1.0
-        normalized_score = 0.0
-        if total_weight_possible > 0:
-            normalized_score = total_weight_achieved / total_weight_possible
-
-        festival_results[festival] = {
-            "score": total_weight_achieved,      # Điểm thô (User muốn xem cộng dồn)
-            "normalized_score": normalized_score, # Điểm dùng để so sánh (đã chia tổng) --------------
-            "hard_failed": hard_failed,
-            "satisfied": (not hard_failed) and (total_weight_achieved >= score_threshold) #---------------------
-        }
-
-    # --- 4. Chọn kết quả tốt nhất ---
-    # Lọc ra các lễ hội thỏa mãn điều kiện
-    valid_festivals = {
-        f: r["normalized_score"]
-        for f, r in festival_results.items()
-        if r["satisfied"]
-    }
-
-    if valid_festivals:
-        # Chọn lễ hội có điểm chuẩn hóa cao nhất
-        best_festival = max(valid_festivals, key=valid_festivals.get)
-        return {
-            "festival": best_festival,
-            "score": valid_festivals[best_festival],
-            "details": festival_results
-        }
-    else:
-        # Fallback: Nếu không ai đạt threshold, trả về None hoặc người có điểm cao nhất (nhưng satisfied=False)
-        return {
-            "festival": None,
-            "score": 0.0,
-            "details": festival_results
-        }
-
-def get_unsatisfied_constraints(candidate_name, detections):
-    """
-    Hàm này thay thế/bổ sung cho model.py.
-    Nó kiểm tra lại lễ hội 'candidate_name' với 'detections' hiện có 
-    và trả về danh sách các luật KHÔNG thỏa mãn.
-    
-    Returns:
-        list of tuples: [(rule, weight_of_rule), ...]
-    """
-    if candidate_name not in CONSTRAINTS_DB:
-        return []
-
-    constraints = CONSTRAINTS_DB[candidate_name]
-    
-    # Indexing detections
-    detections_by_subclass = defaultdict(list)
-    detections_by_frame = defaultdict(list)
-    for det in detections:
-        detections_by_subclass[det.subclass].append(det)
-        detections_by_frame[det.frame_id].append(det)
-
-    unsatisfied = []
-
-    for rule in constraints:
+    def check_constaints(self, rule, by_subclass, by_frame):
+        """Kiểm tra 1 rule có thỏa mãn không. Trả về Bool."""
         ctype, params, is_hard, weight, threshold = rule
         satisfied = False
-        
-        # --- Logic kiểm tra (giống model.py) ---
+
         if ctype == "is_presence":
-            missing = [p for p in params if p not in detections_by_subclass]
+            missing = [p for p in params if p not in by_subclass]
             satisfied = len(missing) == 0
             
         elif ctype == "is_presence_in_frame":
-            # Cần tất cả params xuất hiện trong cùng 1 frame bất kỳ
-            for fid, dets in detections_by_frame.items():
+            for fid, dets in by_frame.items():
                 subs = {d.subclass for d in dets}
                 if all(p in subs for p in params):
                     satisfied = True; break
                     
         elif ctype == "at_least":
-            threshold = threshold or 1
-            total_count = 0
-            for p in params:
-                if p in detections_by_subclass:
-                    total_count += sum(d.count for d in detections_by_subclass[p])
-            satisfied = total_count >= threshold
+            total = sum(sum(d.count for d in by_subclass[p]) for p in params if p in by_subclass)
+            satisfied = total >= (threshold or 1)
             
         elif ctype == "at_least_in_frame":
-            threshold = threshold or 1
-            for fid, dets in detections_by_frame.items():
-                frame_cnt = sum(d.count for d in dets if d.subclass in params)
-                if frame_cnt >= threshold:
+            for fid, dets in by_frame.items():
+                cnt = sum(d.count for d in dets if d.subclass in params)
+                if cnt >= (threshold or 1):
                     satisfied = True; break
                     
         elif ctype == "confidence_min":
-            # Logic này hơi khó hỏi user, nhưng cứ đưa vào kiểm tra
-            target_subs = list(detections_by_subclass.keys()) if "all" in params else [p for p in params if p in detections_by_subclass]
-            if target_subs:
-                total_conf = sum(d.confidence * d.count for sub in target_subs for d in detections_by_subclass[sub])
-                total_cnt = sum(d.count for sub in target_subs for d in detections_by_subclass[sub])
+            target = list(by_subclass.keys()) if "all" in params else [p for p in params if p in by_subclass]
+            if target:
+                total_conf = sum(d.confidence * d.count for s in target for d in by_subclass[s])
+                total_cnt = sum(d.count for s in target for d in by_subclass[s])
                 avg = total_conf / total_cnt if total_cnt > 0 else 0
                 satisfied = avg >= (threshold or 0)
-            else:
-                satisfied = False
-
-        elif ctype == "is_on":
-            # Logic is_on đơn giản hóa cho việc check
-            if len(params) == 2:
-                # Nếu cả 2 cùng xuất hiện trong video thì tạm coi là thỏa (để user confirm lại mối quan hệ)
-                satisfied = all(p in detections_by_subclass for p in params)
-            else:
-                satisfied = False
-
-        # Nếu không thỏa, thêm vào list unsatisfied
-        if not satisfied:
-            unsatisfied.append(rule)
-
-    return unsatisfied
-
-def calculate_initial_score(candidate_name, detections):
-    """Tính điểm ban đầu dựa trên AI detection"""
-    if candidate_name not in CONSTRAINTS_DB: return 0.0, 1.0
-    
-    constraints = CONSTRAINTS_DB[candidate_name]
-    total_possible = 0.0
-    total_achieved = 0.0
-    
-    # Tái sử dụng logic get_unsatisfied để biết cái nào satisfied (ngược lại)
-    # Tuy nhiên để tối ưu tốc độ, ta code nhanh logic tính tổng
-    unsatisfied_rules = get_unsatisfied_constraints(candidate_name, detections)
-    # Chuyển list rule thành set để tra cứu
-    # Lưu ý: list không hashable, nên ta so sánh identity hoặc content
-    
-    for rule in constraints:
-        weight = rule[3]
-        total_possible += weight
-        if rule not in unsatisfied_rules:
-            total_achieved += weight
             
-    return total_achieved, total_possible
+        elif ctype == "is_on" and len(params) == 2:
+            satisfied = self._check_is_on(params[0], params[1], by_subclass, by_frame)
+            
+        return satisfied
 
-def generate_question(candidate_name, rule, api_key):
-    """Sinh câu hỏi dựa trên luật bị thiếu"""
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key)
-    ctype, params, is_hard, weight, threshold = rule
-    
-    prompt_template = """
-    Bạn là trợ lý AI xác thực lễ hội.
-    Lễ hội đang xét: "{candidate}".
-    Luật chưa thỏa mãn: Loại "{ctype}", Đối tượng liên quan "{params}".
-    
-    Hãy đặt một câu hỏi ngắn gọn (dưới 20 từ) cho người dùng để xác nhận xem họ có thấy các yếu tố này trong video không.
-    - Nếu là 'is_presence'/'at_least': Hỏi có thấy [đối tượng] không.
-    - Nếu là 'is_on': Hỏi có thấy [đối tượng 1] nằm trên/cạnh [đối tượng 2] không.
-    - Nếu là 'at_least_in_frame': Hỏi có thấy nhiều [đối tượng] xuất hiện cùng lúc cùng nhau không.
-    - Nếu là 'is_presence_in_frame': Hỏi có thấy các đối tượng {params} xuất hiện cùng nhau không.
-    
-    Câu hỏi:
-    """
-    prompt = ChatPromptTemplate.from_template(prompt_template)
-    chain = prompt | llm | StrOutputParser()
-    return chain.invoke({"candidate": candidate_name, "ctype": ctype, "params": ", ".join(params)})
+    def calculate_initial_logits(self, detections):
+        """
+        BƯỚC 2: Tính Logit ban đầu dựa trên bằng chứng máy thấy.
+        Logic: Logit khởi tạo = 0.
+            Nếu rule thỏa mãn -> Logit += weight
+            Nếu rule KHÔNG thỏa -> Bỏ qua (Logit += 0), KHÔNG TRỪ ĐIỂM.
+        """
+        by_subclass, by_frame = self._index_detections(detections)
+        festival_logits = {}
+        festival_unsatisfied = defaultdict(list)
 
-def analyze_user_response(question, user_answer, api_key):
-    """Phân tích câu trả lời Yes/No"""
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0)
-    
-    prompt_template = """
-    AI hỏi: "{question}"
-    User trả lời: "{answer}"
-    
-    Hãy xác định ý định của User:
-    - Nếu User xác nhận có thấy/đúng -> Trả về "YES"
-    - Nếu User phủ nhận/không thấy -> Trả về "NO"
-    - Nếu không rõ -> Trả về "UNKNOWN"
-    
-    Chỉ trả về đúng 1 từ kết quả.
-    """
-    prompt = ChatPromptTemplate.from_template(prompt_template)
-    chain = prompt | llm | StrOutputParser()
-    return chain.invoke({"question": question, "answer": user_answer}).strip()
+        for festival, rules in CONSTRAINTS_DB.items():
+            current_logit = 0.0 # Bắt đầu ở mức trung lập (p=0.5)
+            
+            for rule in rules:
+                ctype, params, is_hard, weight, threshold = rule
+                is_satisfied = self.check_constaints(rule, by_subclass, by_frame)
+                
+                if is_satisfied:
+                    # Bằng chứng dương tính -> Cộng điểm
+                    current_logit += weight
+                else:
+                    # Bằng chứng âm tính -> Bỏ qua (Ignore), không trừ điểm
+                    # Nhưng vẫn lưu vào danh sách để hỏi user xem có bị sót không
+                    festival_unsatisfied[festival].append(rule)
+            
+            festival_logits[festival] = current_logit
+            
+        return festival_logits, festival_unsatisfied
 
+    def select_candidates(self, festival_logits):
+        """
+        BƯỚC 3: Lọc ứng viên dựa trên Probability (Sigmoid của Logit)
+        """
+        # Chuyển logit sang probability để so sánh với threshold
+        festival_probs = {f: sigmoid(l) for f, l in festival_logits.items()}
+        
+        if not festival_probs: return []
+        
+        max_prob = max(festival_probs.values())
+        candidates = []
+        
+        print(f"\n📊 BẢNG XẾP HẠNG BAN ĐẦU (AI DETECT - LOGIT SPACE):")
+        sorted_fests = sorted(festival_probs.items(), key=lambda x: x[1], reverse=True)
+        for f, p in sorted_fests:
+            print(f"   - {f}: {p:.2%} (Logit: {festival_logits[f]:.2f})")
 
-# Ví dụ sử dụng
+        for f, p in festival_probs.items():
+            # Logic chọn ứng viên từ PSEUDO
+            if p >= GLOBAL_CONFIG["T_high"]:
+                candidates.append(f)
+            elif p >= GLOBAL_CONFIG["T_low"] and (max_prob - p) <= GLOBAL_CONFIG["delta"]:
+                candidates.append(f)
+                
+        return candidates
+
+    # ==========================================
+    # PHẦN 3: LLM INTERACTION (CẢI TIẾN)
+    # ==========================================
+    def generate_question_smart(self, festival, rule):
+        """Sinh câu hỏi thông minh có ngữ cảnh"""
+        ctype, params, _, _, _ = rule
+        param_str = ", ".join(params)
+        
+        prompt = f"""
+        Bạn là trợ lý AI đang xác minh video lễ hội "{festival}".
+        Hệ thống thị giác máy tính ĐÃ QUÉT video nhưng KHÔNG TÌM THẤY hoặc KHÔNG CHẮC CHẮN về yếu tố sau:
+        - Loại luật: {ctype}
+        - Đối tượng cần tìm: {param_str}
+        
+        Nhiệm vụ: Hãy đặt một câu hỏi Ngắn Gọn, Tự Nhiên cho người dùng để họ xác nhận bằng mắt thường.
+        - Nếu là 'is_presence'/'at_least': Hỏi "Bạn có thấy [đối tượng] xuất hiện xung quanh không?"
+        - Nếu là 'is_on': Hỏi "Bạn có thấy [đối tượng 1] nằm trên [đối tượng 2] không?"
+        - Đừng dùng từ ngữ kỹ thuật như "bounding box", "frame".
+        
+        Câu hỏi:
+        """
+        return self.llm.invoke(prompt).content.strip()
+
+    def analyze_answer_smart(self, question, answer):
+        """Phân tích câu trả lời với sắc thái Tiếng Việt (Thang đo 0-1 cho Additive Logic)"""
+        prompt = f"""
+        Ngữ cảnh: AI hỏi về sự xuất hiện của sự vật trong video.
+        AI hỏi: "{question}"
+        User trả lời: "{answer}"
+        
+        Hãy phân tích thái độ của user để đưa ra điểm số (0 đến 1) về mức độ xác nhận:
+        - 1.0: Chắc chắn CÓ, Đúng, Thấy rõ. (Positive Confirmation)
+        - 0.5: Hình như có, Có vẻ là vậy, Không chắc lắm. (Weak Confirmation)
+        - 0.0: KHÔNG, Không thấy, Không rõ, Hình như không. (Negative/Unknown)
+        
+        Chỉ trả về CON SỐ (VD: 1.0, 0.5, 0.0).
+        """
+        result = self.llm.invoke(prompt).content.strip()
+        try:
+            return float(result)
+        except:
+            return 0.0
+
+    def get_verification_questions(self, candidates, festival_unsatisfied):
+        """
+        BƯỚC 4a (Frontend-ready): Sinh danh sách câu hỏi để gửi xuống Client.
+        Thay vì hỏi trực tiếp, hàm này trả về cấu trúc dữ liệu câu hỏi (JSON friendly).
+        """
+        questions_payload = []
+        
+        print(f"\nĐang sinh câu hỏi xác thực cho: {candidates}...")
+
+        for fest in candidates:
+            unsatisfied_rules = festival_unsatisfied[fest]
+            if not unsatisfied_rules:
+                continue
+            
+            # Sắp xếp luật theo trọng số giảm dần
+            unsatisfied_rules.sort(key=lambda x: x[3], reverse=True)
+            
+            # Chỉ lấy tối đa 3 câu hỏi quan trọng nhất
+            max_questions = 3
+            
+            for i, rule in enumerate(unsatisfied_rules[:max_questions]):
+                weight = rule[3]
+                question_text = self.generate_question_smart(fest, rule)
+                
+                # Đóng gói object câu hỏi
+                q_obj = {
+                    "question_id": f"{fest}_{i}",
+                    "festival": fest,
+                    "question_text": question_text,
+                    "rule_weight": weight,
+                    # "rule_type": rule[0], # Nếu frontend cần hiển thị icon/loại luật
+                    # "params": rule[1]
+                }
+                questions_payload.append(q_obj)
+                
+        return questions_payload
+
+    def process_user_answers(self, festival_logits, user_responses):
+        """
+        BƯỚC 4b (Frontend-ready): Nhận danh sách câu trả lời từ Client và cập nhật Logit.
+        user_responses: List các dict chứa {question_text, answer, rule_weight, festival}
+        """
+        final_logits = festival_logits.copy()
+        
+        print(f"\n🔄 Đang xử lý {len(user_responses)} câu trả lời từ người dùng...")
+
+        for response in user_responses:
+            fest = response.get("festival")
+            weight = response.get("rule_weight")
+            question = response.get("question_text")
+            answer = response.get("answer")
+            
+            if not (fest and weight and question and answer):
+                continue
+
+            # Phân tích câu trả lời bằng LLM
+            score_mod = self.analyze_answer_smart(question, answer)
+            
+            # Logic cập nhật: Chỉ thưởng nếu đúng (độ tin cậy cao)
+            if score_mod >= 0.8: # User xác nhận chắc chắn
+                final_logits[fest] += weight
+                print(f"   => [{fest}] User YES (+{weight:.2f}): {question} -> {answer}")
+            else:
+                # User trả lời Không hoặc Không rõ hoặc Lưỡng lự -> Bỏ qua
+                print(f"   => [{fest}] User NO/UNCLEAR (Skip): {question} -> {answer}")
+                
+        return final_logits
+
+    def decide_final_result(self, final_logits):
+        """BƯỚC 5: Kết luận cuối cùng"""
+        final_probs = {f: sigmoid(l) for f, l in final_logits.items()}
+        results = []
+        
+        print(f"\n🏆 KẾT QUẢ CUỐI CÙNG:")
+        for f, p in final_probs.items():
+            if p >= GLOBAL_CONFIG["T_out"]:
+                results.append(f)
+                print(f"{f}: {p:.2%} (ĐẠT)")
+            else:
+                print(f"{f}: {p:.2%} (TRƯỢT)")
+                
+        return results, final_probs
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
 if __name__ == "__main__":
+    # Cấu hình đường dẫn
+    MODEL_PATH = '../weight/best.pt' # Thay đường dẫn thật
+    CSV_PATH = '../artifacts/merged_data.csv' # Thay đường dẫn thật
+    VIDEO_PATH = '../assets/input/2.mp4' # Thay đường dẫn thật
+    API_KEY = API_KEY # Điền API Key
 
-    from constraintsDB import CONSTRAINTS_DB, SUBCLASS_TO_FESTIVAL
+    # 1. Khởi tạo Pipeline
+    yolo_pipe = YOLOCSVPipeline(MODEL_PATH, CSV_PATH)
+    classifier = BayesianFestivalClassifier(API_KEY)
 
-    model_path = '../weight/best.pt'
-    csv_path = '../artifacts/merged_data.csv'
-    video_path = '../assets/input/1.mp4'
-    output_video_path = '../assets/output/1_detected.mp4'
+    print("\n--- BƯỚC 1: YOLO DETECTION ---")
+    detections = yolo_pipe.process_video(VIDEO_PATH, fps_detect=1)
+    print(f"Đã phát hiện {len(detections)} đối tượng/sự kiện.")
 
-    # Khởi tạo pipeline
-    pipeline = YOLOCSVPipeline(
-        model_path=model_path,
-        csv_path=csv_path
-    )
+    print("\n--- BƯỚC 2: TÍNH LOGIT & CHECK RÀNG BUỘC TỰ ĐỘNG ---")
+    logits, unsatisfied = classifier.calculate_initial_logits(detections)
 
-    # Xử lý video và lưu kết quả
-    result = pipeline.process_video_with_output(
-        video_path=video_path,
-        output_path=output_video_path,  # None = tự động tạo tên
-        confidence_threshold=0.5,
-        fps_detect=1,  # Detect 1 frame/giây
-        max_duration=30,  # Xử lý tối đa 30 giây
-        output_fps=None,  # None = giữ nguyên FPS gốc
-        save_frames=False,  # Lưu các frame đã detect
-        output_folder='detected_frames',
-        top_k=10
-    )
+    print("\n--- BƯỚC 3: LỌC ỨNG VIÊN ---")
+    candidates = classifier.select_candidates(logits)
+    
+    if not candidates:
+        print("❌ Không có lễ hội nào tiềm năng dựa trên hình ảnh.")
+    else:
+        # --- MÔ PHỎNG LUỒNG FRONTEND ---
+        print("\n--- BƯỚC 4a: SERVER SINH CÂU HỎI (GỬI CHO FRONTEND) ---")
+        questions_json = classifier.get_verification_questions(candidates, unsatisfied)
+        
+        # In ra để kiểm tra (đây là dữ liệu API trả về)
+        for q in questions_json:
+            print(f"   [JSON] {q['festival']} | Weight: {q['rule_weight']} | Q: {q['question_text']}")
 
-    # Chuyển đổi kết quả của hàm dự đoán thành list đối tượng
-    summary = result
-
-    object_detections = []  # danh sách ObjectDetection
-
-    for frame_data in summary['frame_details']:
-        frame_id = frame_data['frame']
-        time_stamp = frame_data['time']
-        detections = frame_data['detections']
-
-        # Gom nhóm detection theo subclass (label)
-        subclass_groups = {}
-        for det in detections:
-            if det['mapped']:
-                subclass = det['label']
-                if subclass not in subclass_groups:
-                    subclass_groups[subclass] = {'confidences': [], 'bboxs': []}
-                subclass_groups[subclass]['confidences'].append(det['confidence'])
-                subclass_groups[subclass]['bboxs'].append(det['box'].tolist())  # numpy → list
-
-        # Tạo ObjectDetection cho mỗi subclass trong frame
-        for subclass, data in subclass_groups.items():
-            avg_conf = np.mean(data['confidences']) if data['confidences'] else 0.0
-            count = len(data['bboxs'])  # số lần subclass xuất hiện trong frame
-
-            obj = ObjectDetection(
-                subclass=subclass,
-                confidence=avg_conf,
-                frame_id=frame_id,
-                time_stamp=time_stamp,
-                count=count,
-                bboxs=data['bboxs']  # danh sách bounding boxes
-            )
-            object_detections.append(obj)
-
-    print(f"✅ Đã tạo {len(object_detections)} đối tượng ObjectDetection (có bboxs).")
-
-    print(check_constraints(object_detections, CONSTRAINTS_DB, SUBCLASS_TO_FESTIVAL, score_threshold=1.0))
+        # --- MÔ PHỎNG USER TRẢ LỜI Ở FRONTEND ---
+        # Giả sử user trả lời một số câu hỏi (đây là dữ liệu Frontend gửi lên)
+        print("\n--- ... (Frontend hiển thị và User nhập liệu) ... ---")
+        user_responses_mock = []
+        
+        # Code giả lập việc nhập liệu (chỉ để test file này chạy được)
+        # Trong thực tế, bạn bỏ đoạn input() này đi và nhận JSON từ request
+        if questions_json:
+            print(">> Hãy nhập câu trả lời giả lập (Enter để skip):")
+            for q in questions_json[:2]: # Hỏi thử 2 câu đầu
+                ans = input(f"   {q['question_text']}? ")
+                if ans:
+                    response_obj = q.copy() # Copy lại thông tin câu hỏi
+                    response_obj["answer"] = ans
+                    user_responses_mock.append(response_obj)
+        
+        print("\n--- BƯỚC 4b: SERVER XỬ LÝ CÂU TRẢ LỜI ---")
+        final_logits = classifier.process_user_answers(logits, user_responses_mock)
+        
+        print("\n--- BƯỚC 5: KẾT LUẬN ---")
+        winners, final_probs = classifier.decide_final_result(final_logits)
+        
+        if len(winners) == 1:
+            print(f"\n🎉 VIDEO NÀY THUỘC VỀ: {winners[0]}")
+        elif len(winners) > 1:
+            print(f"\n🎉 VIDEO NÀY CÓ THỂ LÀ SỰ KẾT HỢP: {', '.join(winners)}")
+        else:
+            print("\n🤔 KHÔNG XÁC ĐỊNH ĐƯỢC LỄ HỘI CỤ THỂ.")
