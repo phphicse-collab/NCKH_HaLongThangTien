@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Festival Detection System</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <style>
+        
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🎉 Festival Detection System</h1>
+        <p>Upload hình ảnh/video lễ hội và mô tả thêm để AI phân tích chính xác hơn!</p>
+    </header>
+
+    <div class="container">
+        <!-- Upload Section -->
+        <div class="card">
+            <h2>📤 Upload Hình Ảnh hoặc Video</h2>
+            <div class="upload-area" id="imageDrop" onclick="document.getElementById('imageInput').click()">
+                <p>📷 Kéo thả hoặc click để upload nhiều ảnh</p>
+                <input type="file" id="imageInput" accept="image/*" multiple style="display:none">
+            </div>
+            <div class="upload-area" id="videoDrop" onclick="document.getElementById('videoInput').click()">
+                <p>🎥 Kéo thả hoặc click để upload video</p>
+                <input type="file" id="videoInput" accept="video/*" style="display:none">
+            </div>
+
+            <div id="previewContainer" class="preview-grid"></div>
+        </div>
+
+        <!-- Chat Box -->
+        <div class="card">
+            <h2>💬 Chat với AI (Mô tả thêm những gì bạn thấy)</h2>
+            <div class="chat-container">
+                <div id="chatMessages" class="chat-messages">
+                    <div class="message ai">Xin chào! Hãy upload file và mô tả thêm để tôi phân tích lễ hội nhé 😊</div>
+                </div>
+                <div class="chat-input">
+                    <input type="text" id="chatInput" placeholder="Ví dụ: Tôi thấy có đèn gió và ghe ngo...">
+                    <button onclick="sendMessage()">Gửi</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Kết quả -->
+        <div class="card winner-card" id="resultCard" style="display:none;">
+            <h2 id="festivalName">Ok Om Bok</h2>
+            <p><strong>Độ tin cậy: <span id="confidence">92%</span></strong></p>
+            <p id="resultText">Video này thuộc về lễ hội <strong>Ok Om Bok</strong> của đồng bào Khmer</p>
+        </div>
+
+        <!-- Giải thích chi tiết -->
+        <div class="card">
+            <h2>🔍 Giải thích chi tiết</h2>
+            <div class="tabs">
+                <div class="tab active" onclick="openTab(event, 'tab1')">Biểu đồ</div>
+                <div class="tab" onclick="openTab(event, 'tab2')">Rules hình ảnh</div>
+                <div class="tab" onclick="openTab(event, 'tab3')">Rules mô tả</div>
+            </div>
+
+            <div id="tab1" class="tab-content active">
+                <div id="chart"></div>
+            </div>
+
+            <div id="tab2" class="tab-content">
+                <p>Đang chờ phân tích từ file upload và mô tả chat...</p>
+            </div>
+
+            <div id="tab3" class="tab-content">
+                <p>Lịch sử chat sẽ hiển thị tác động đến kết quả ở đây.</p>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        <p>&copy; 2025 Festival Detection System - HTML/CSS/JS thuần</p>
+    </footer>
+
+    <script src="main.js"></script>
+</body>
+</html>
